@@ -52,8 +52,8 @@ def create_invoice(user_id, amount=12):
         "price_currency": "usd",
         "pay_currency": "trx",
         "order_id": f"user_{user_id}",
-        # CAMBIO: La descripción de la orden ahora es de 1 día
-        "order_description": "Membresía de prueba Ghost Traders - 1 día",
+        # CAMBIO: La descripción de la orden ahora es de 1 hora
+        "order_description": "Membresía de prueba Ghost Traders - 1 hora",
         "ipn_callback_url": f"{base_url}/webhook/nowpayments",
         "success_url": "https://t.me/ghost_traders_bot?start=success",
     }
@@ -98,12 +98,12 @@ async def start(update: Update, context):
         if pay_url:
             await update.message.reply_text(
                 f"¡Bienvenido a Ghost Traders! 👻\n\n"
-                # CAMBIO: El mensaje ahora indica 12 USDT y 1 día
+                # CAMBIO: El mensaje ahora indica 12 USDT y 1 hora
                 f"Para unirte al grupo de prueba, realiza el pago de **12 USDT en TRX**:\n\n"
                 f"🔗 **Link de pago**: {pay_url}\n\n"
                 f"📋 **Invoice ID**: {invoice_id}\n\n"
                 f"Una vez completado el pago, serás añadido automáticamente al grupo.\n"
-                f"Tu membresía durará 1 día."
+                f"Tu membresía durará 1 hora."
             )
         else:
             await update.message.reply_text("❌ Error generando el enlace de pago. Intenta de nuevo más tarde.")
@@ -142,8 +142,8 @@ def nowpayments_webhook():
             if order_id.startswith('user_'):
                 try:
                     user_id = int(order_id.split('_')[1])
-                    # CAMBIO: La membresía ahora dura 1 día
-                    end_date = datetime.now() + timedelta(days=1)
+                    # CAMBIO: La membresía ahora dura 1 hora
+                    end_date = datetime.now() + timedelta(hours=1)
                     
                     # Insertar o actualizar membresía
                     supabase.table('memberships').upsert({
