@@ -22,7 +22,7 @@ SUPABASE_URL = os.getenv('SUPABASE_URL')
 SUPABASE_KEY = os.getenv('SUPABASE_KEY')
 NOWPAYMENTS_API_KEY = os.getenv('NOWPAYMENTS_API_KEY')
 NOWPAYMENTS_IPN_SECRET = os.getenv('NOWPAYMENTS_IPN_SECRET')
-GROUP_ID = int(os.getenv('GROUP_ID', -1002877292793))
+GROUP_ID = int(os.getenv('GROUP_ID'))
 PORT = int(os.getenv('PORT', 8080))
 
 # Inicializar bot y supabase
