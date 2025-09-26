@@ -3,7 +3,7 @@ import sys
 import logging
 from flask import Flask, request, jsonify
 from telegram import Bot, Update
-from telegram.ext import Application, CommandHandler, filters, MessageHandler
+from telegram.ext import Application, CommandHandler, filters, MessageHandler, CallbackQueryHandler
 from supabase import create_client, Client
 import requests
 from dotenv import load_dotenv
@@ -13,14 +13,13 @@ import hashlib
 import json
 import asyncio
 import threading
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 # Configurar logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
 
@@ -34,136 +33,458 @@ SUPABASE_URL = os.getenv('SUPABASE_URL')
 SUPABASE_KEY = os.getenv('SUPABASE_KEY')
 NOWPAYMENTS_API_KEY = os.getenv('NOWPAYMENTS_API_KEY')
 NOWPAYMENTS_IPN_SECRET = os.getenv('NOWPAYMENTS_IPN_SECRET')
-GROUP_ID = int(os.getenv('GROUP_ID'))
+GROUP_ID = int(os.getenv('GROUP_ID', -1002877292793))
 PORT = int(os.getenv('PORT', 8080))
 
-logger.info(f"Iniciando bot con configuraciones:")
+logger.info(f"🚀 Iniciando Ghost Traders Bot")
 logger.info(f"- TELEGRAM_TOKEN: {'✅' if TELEGRAM_TOKEN else '❌'}")
 logger.info(f"- SUPABASE_URL: {'✅' if SUPABASE_URL else '❌'}")
 logger.info(f"- SUPABASE_KEY: {'✅' if SUPABASE_KEY else '❌'}")
 logger.info(f"- NOWPAYMENTS_API_KEY: {'✅' if NOWPAYMENTS_API_KEY else '❌'}")
 logger.info(f"- GROUP_ID: {GROUP_ID}")
+logger.info(f"- PORT: {PORT}")
 
-# Inicializar bot y supabase
+# Inicializar servicios
 try:
     bot = Bot(TELEGRAM_TOKEN)
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
     logger.info("✅ Bot y Supabase inicializados correctamente")
 except Exception as e:
     logger.error(f"❌ Error inicializando servicios: {e}")
+    sys.exit(1)
 
+# Variable global para la aplicación
 application = None
 
-# Variable para obtener la URL del servidor
-BASE_URL = None
-
 def get_base_url():
-    global BASE_URL
-    if not BASE_URL:
-        BASE_URL = os.getenv('RENDER_EXTERNAL_URL', 'https://ghost-traders-bot.onrender.com')
-    return BASE_URL
+    """Obtener la URL base del servidor"""
+    return os.getenv('RENDER_EXTERNAL_URL', 'https://ghost-traders-bot.onrender.com')
 
-# Función para generar invoice en NOWPayments
-def create_invoice(user_id, amount=10):
-    logger.info(f"Creando invoice para usuario {user_id}, monto: ${amount}")
+def create_invoice(user_id, amount=12):
+    """Crear factura en NOWPayments"""
+    logger.info(f"🧾 Creando invoice para usuario {user_id}, monto: ${amount}")
+    
     url = "https://api.nowpayments.io/v1/invoice"
-    headers = {"x-api-key": NOWPAYMENTS_API_KEY, "Content-Type": "application/json"}
+    headers = {
+        "x-api-key": NOWPAYMENTS_API_KEY,
+        "Content-Type": "application/json"
+    }
     base_url = get_base_url()
     
     payload = {
         "price_amount": amount,
         "price_currency": "usd",
-        "pay_currency": "trx",
-        "order_id": f"user_{user_id}",
-        "order_description": "Membresía Ghost Traders - 30 días",
+        "pay_currency": "usdttrc20",  # USDT TRC20
+        "order_id": f"user_{user_id}_{int(datetime.now().timestamp())}",
+        "order_description": "Ghost Traders - Membresía 30 días",
         "ipn_callback_url": f"{base_url}/webhook/nowpayments",
         "success_url": "https://t.me/ghost_traders_bot?start=success",
+        "cancel_url": "https://t.me/ghost_traders_bot?start=cancelled"
     }
     
     try:
-        response = requests.post(url, headers=headers, json=payload)
-        logger.info(f"NOWPayments response status: {response.status_code}")
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        logger.info(f"📡 NOWPayments response: {response.status_code}")
         
         if response.status_code == 201:
             data = response.json()
-            logger.info(f"✅ Invoice creado exitosamente: {data.get('id')}")
-            return data['invoice_url'], data['id']
+            logger.info(f"✅ Invoice creado: {data.get('id')}")
+            return data.get('invoice_url'), data.get('id')
         else:
             logger.error(f"❌ Error NOWPayments: {response.text}")
+            return None, None
+            
+    except requests.exceptions.Timeout:
+        logger.error("⏰ Timeout creando invoice")
+        return None, None
     except Exception as e:
-        logger.error(f"❌ Error creando invoice: {e}")
-    return None, None
+        logger.error(f"❌ Excepción creando invoice: {e}")
+        return None, None
 
-# Handler para /start
-async def start(update: Update, context):
-    user_id = update.message.from_user.id
-    username = update.message.from_user.username or "Sin username"
-    logger.info(f"📩 Comando /start recibido de usuario {user_id} (@{username})")
+async def start_command(update: Update, context):
+    """Handler del comando /start"""
+    user = update.effective_user
+    user_id = user.id
+    username = user.username or "Sin username"
+    first_name = user.first_name or "Usuario"
+    
+    logger.info(f"👤 /start de {first_name} (@{username}) - ID: {user_id}")
     
     try:
-        # Verificar membresía existente
-        logger.info(f"Verificando membresía existente para usuario {user_id}")
+        # Verificar membresía activa
         result = supabase.table('memberships').select('*').eq('telegram_user_id', user_id).execute()
         
         if result.data:
             membership = result.data[0]
             end_date_str = membership['membership_end_date']
-            logger.info(f"Membresía encontrada, expira: {end_date_str}")
             
-            # Parsear fecha
-            end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
+            # Parsear fecha correctamente
+            if end_date_str.endswith('Z'):
+                end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
+            elif '+00:00' in end_date_str:
+                end_date = datetime.fromisoformat(end_date_str)
+            else:
+                end_date = datetime.fromisoformat(end_date_str + '+00:00')
             
             if end_date > datetime.now(end_date.tzinfo):
+                # Membresía activa
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔗 Unirse al Grupo", callback_data=f"join_group_{user_id}")],
+                    [InlineKeyboardButton("📊 Mi Membresía", callback_data=f"my_membership_{user_id}")]
+                ])
+                
                 await update.message.reply_text(
-                    f"¡Hola {username}! Ya eres miembro activo.\n"
-                    f"Tu membresía expira el: {end_date.strftime('%d/%m/%Y %H:%M')}\n\n"
-                    "Intentando añadirte al grupo..."
+                    f"¡Hola {first_name}! 👻\n\n"
+                    f"✅ Tu membresía está **ACTIVA**\n"
+                    f"📅 Expira: {end_date.strftime('%d/%m/%Y %H:%M')}\n\n"
+                    f"Haz clic en 'Unirse al Grupo' para obtener el enlace:",
+                    reply_markup=keyboard,
+                    parse_mode='Markdown'
                 )
-                try:
-                    await bot.unban_chat_member(GROUP_ID, user_id)
-                    await bot.send_message(user_id, "✅ Has sido añadido al grupo exitosamente!")
-                    logger.info(f"✅ Usuario {user_id} añadido al grupo")
-                except Exception as e:
-                    logger.error(f"❌ Error añadiendo al grupo: {e}")
-                    await update.message.reply_text(f"❌ Error al añadir al grupo: {str(e)}")
                 return
 
-        # Crear nueva factura de pago
-        logger.info(f"Creando nueva factura para usuario {user_id}")
-        pay_url, invoice_id = create_invoice(user_id)
-        if pay_url:
-            await update.message.reply_text(
-                f"¡Bienvenido a Ghost Traders! 👻\n\n"
-                f"Para unirte al grupo VIP, realiza el pago de **10 USD en TRX**:\n\n"
-                f"🔗 **Link de pago**: {pay_url}\n\n"
-                f"📋 **Invoice ID**: {invoice_id}\n\n"
-                f"Una vez completado el pago, serás añadido automáticamente al grupo.\n"
-                f"Tu membresía durará 30 días."
-            )
-            logger.info(f"✅ Enlace de pago enviado a usuario {user_id}")
-        else:
-            await update.message.reply_text("❌ Error generando el enlace de pago. Intenta de nuevo más tarde.")
-            logger.error(f"❌ No se pudo crear invoice para usuario {user_id}")
-            
+        # Usuario nuevo o membresía expirada
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💰 Pagar Membresía - $12 USDT", callback_data=f"pay_membership_{user_id}")],
+            [InlineKeyboardButton("ℹ️ Información", callback_data="info")]
+        ])
+        
+        await update.message.reply_text(
+            f"¡Bienvenido a Ghost Traders! 👻\n\n"
+            f"🎯 **Plan de Prueba Especial**\n"
+            f"💰 Solo **$12 USDT (TRC20)**\n"
+            f"⏰ Acceso por **30 días**\n\n"
+            f"🔥 **¿Qué obtienes?**\n"
+            f"• Acceso al grupo VIP\n"
+            f"• Señales de trading premium\n"
+            f"• Análisis técnico diario\n"
+            f"• Soporte 24/7\n\n"
+            f"👇 Haz clic para comenzar:",
+            reply_markup=keyboard,
+            parse_mode='Markdown'
+        )
+        
     except Exception as e:
-        logger.error(f"❌ Error en comando start: {e}")
-        await update.message.reply_text("❌ Error interno. Intenta de nuevo más tarde.")
+        logger.error(f"❌ Error en start_command: {e}")
+        await update.message.reply_text(
+            "❌ Error interno. Intenta de nuevo en un momento.",
+            parse_mode='Markdown'
+        )
 
-# Handler para otros mensajes
+async def button_callback(update: Update, context):
+    """Handler para botones inline"""
+    query = update.callback_query
+    user = query.from_user
+    data = query.data
+    
+    logger.info(f"🔘 Callback: {data} de usuario {user.id}")
+    
+    await query.answer()
+    
+    if data.startswith("pay_membership_"):
+        user_id = int(data.split("_")[-1])
+        
+        # Crear invoice
+        pay_url, invoice_id = create_invoice(user_id, 12)
+        
+        if pay_url and invoice_id:
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("💳 Realizar Pago", url=pay_url)],
+                [InlineKeyboardButton("🔄 Verificar Pago", callback_data=f"check_payment_{user_id}_{invoice_id}")],
+                [InlineKeyboardButton("⬅️ Volver", callback_data="back_to_start")]
+            ])
+            
+            await query.edit_message_text(
+                f"💳 **Pago Generado**\n\n"
+                f"💰 **Monto**: $12 USDT (TRC20)\n"
+                f"📋 **Invoice ID**: `{invoice_id}`\n\n"
+                f"**⚠️ Instrucciones:**\n"
+                f"1. Haz clic en 'Realizar Pago'\n"
+                f"2. Completa el pago exacto\n"
+                f"3. Vuelve y haz clic en 'Verificar Pago'\n\n"
+                f"⏱️ El pago expira en 30 minutos",
+                reply_markup=keyboard,
+                parse_mode='Markdown'
+            )
+        else:
+            await query.edit_message_text(
+                "❌ Error generando el enlace de pago.\n"
+                "Intenta de nuevo más tarde.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔄 Reintentar", callback_data=f"pay_membership_{user_id}")
+                ]])
+            )
+    
+    elif data.startswith("check_payment_"):
+        parts = data.split("_")
+        user_id = int(parts[2])
+        invoice_id = parts[3]
+        
+        # Verificar estado del pago
+        await verify_payment_status(query, user_id, invoice_id)
+    
+    elif data.startswith("join_group_"):
+        user_id = int(data.split("_")[-1])
+        await generate_group_invite(query, user_id)
+    
+    elif data.startswith("my_membership_"):
+        user_id = int(data.split("_")[-1])
+        await show_membership_info(query, user_id)
+    
+    elif data == "info":
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬅️ Volver", callback_data="back_to_start")
+        ]])
+        
+        await query.edit_message_text(
+            f"📊 **Información del Servicio**\n\n"
+            f"🏷️ **Precio**: $12 USDT (TRC20)\n"
+            f"⏰ **Duración**: 30 días\n"
+            f"💳 **Método de pago**: Crypto (USDT TRC20)\n"
+            f"🔒 **Seguro**: Pagos procesados por NOWPayments\n\n"
+            f"❓ **¿Dudas?** Contacta: @admin\n",
+            reply_markup=keyboard,
+            parse_mode='Markdown'
+        )
+    
+    elif data == "back_to_start":
+        # Simular comando start
+        await start_command_from_callback(query)
+
+async def verify_payment_status(query, user_id, invoice_id):
+    """Verificar estado del pago en NOWPayments"""
+    logger.info(f"🔍 Verificando pago {invoice_id} para usuario {user_id}")
+    
+    try:
+        url = f"https://api.nowpayments.io/v1/payment/{invoice_id}"
+        headers = {"x-api-key": NOWPAYMENTS_API_KEY}
+        
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            status = data.get('payment_status', 'unknown')
+            
+            logger.info(f"📊 Estado del pago: {status}")
+            
+            if status == 'finished':
+                # Activar membresía
+                end_date = datetime.now() + timedelta(days=30)
+                
+                supabase.table('memberships').upsert({
+                    'telegram_user_id': user_id,
+                    'membership_end_date': end_date.isoformat(),
+                    'status': 'active',
+                    'payment_id': invoice_id
+                }).execute()
+                
+                logger.info(f"✅ Membresía activada para usuario {user_id}")
+                
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔗 Unirse al Grupo", callback_data=f"join_group_{user_id}")
+                ]])
+                
+                await query.edit_message_text(
+                    f"🎉 **¡Pago Confirmado!**\n\n"
+                    f"✅ Tu membresía ha sido activada\n"
+                    f"📅 Válida hasta: {end_date.strftime('%d/%m/%Y %H:%M')}\n\n"
+                    f"¡Bienvenido a Ghost Traders! 👻",
+                    reply_markup=keyboard,
+                    parse_mode='Markdown'
+                )
+            
+            elif status in ['waiting', 'confirming', 'sending']:
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Verificar Nuevamente", callback_data=f"check_payment_{user_id}_{invoice_id}")],
+                    [InlineKeyboardButton("⬅️ Volver", callback_data="back_to_start")]
+                ])
+                
+                await query.edit_message_text(
+                    f"⏳ **Pago en Proceso**\n\n"
+                    f"📊 Estado actual: `{status}`\n"
+                    f"🔄 Verificaremos automáticamente tu pago\n\n"
+                    f"Por favor espera unos minutos...",
+                    reply_markup=keyboard,
+                    parse_mode='Markdown'
+                )
+            
+            else:
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔄 Reintentar Pago", callback_data=f"pay_membership_{user_id}")
+                ]])
+                
+                await query.edit_message_text(
+                    f"❌ **Pago No Encontrado**\n\n"
+                    f"📊 Estado: `{status}`\n"
+                    f"💡 Si ya pagaste, espera unos minutos\n"
+                    f"🔄 O genera un nuevo enlace de pago",
+                    reply_markup=keyboard,
+                    parse_mode='Markdown'
+                )
+        
+        else:
+            logger.error(f"❌ Error verificando pago: {response.status_code}")
+            await query.answer("❌ Error verificando el pago. Intenta de nuevo.")
+    
+    except Exception as e:
+        logger.error(f"❌ Excepción verificando pago: {e}")
+        await query.answer("❌ Error de conexión. Intenta de nuevo.")
+
+async def generate_group_invite(query, user_id):
+    """Generar enlace de invitación al grupo"""
+    logger.info(f"🔗 Generando enlace de grupo para usuario {user_id}")
+    
+    try:
+        # Crear enlace de invitación temporal
+        invite_link = await bot.create_chat_invite_link(
+            chat_id=GROUP_ID,
+            member_limit=1,
+            expire_date=int((datetime.now() + timedelta(minutes=10)).timestamp())
+        )
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🚀 Unirse Ahora", url=invite_link.invite_link)],
+            [InlineKeyboardButton("⬅️ Volver", callback_data="back_to_start")]
+        ])
+        
+        await query.edit_message_text(
+            f"🎯 **Enlace de Invitación**\n\n"
+            f"🔗 Tu enlace personal está listo\n"
+            f"⏰ Válido por **10 minutos**\n\n"
+            f"👇 Haz clic para unirte:",
+            reply_markup=keyboard,
+            parse_mode='Markdown'
+        )
+        
+        logger.info(f"✅ Enlace generado para usuario {user_id}")
+    
+    except Exception as e:
+        logger.error(f"❌ Error generando enlace: {e}")
+        await query.edit_message_text(
+            f"❌ Error generando enlace de invitación.\n"
+            f"Contacta al administrador: @admin",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Volver", callback_data="back_to_start")
+            ]])
+        )
+
+async def show_membership_info(query, user_id):
+    """Mostrar información de la membresía"""
+    try:
+        result = supabase.table('memberships').select('*').eq('telegram_user_id', user_id).execute()
+        
+        if result.data:
+            membership = result.data[0]
+            end_date_str = membership['membership_end_date']
+            
+            if end_date_str.endswith('Z'):
+                end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
+            else:
+                end_date = datetime.fromisoformat(end_date_str + '+00:00')
+            
+            days_left = (end_date - datetime.now(end_date.tzinfo)).days
+            
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔗 Unirse al Grupo", callback_data=f"join_group_{user_id}")],
+                [InlineKeyboardButton("⬅️ Volver", callback_data="back_to_start")]
+            ])
+            
+            await query.edit_message_text(
+                f"📊 **Tu Membresía**\n\n"
+                f"✅ Estado: **Activa**\n"
+                f"📅 Expira: {end_date.strftime('%d/%m/%Y %H:%M')}\n"
+                f"⏰ Días restantes: **{days_left}**\n\n"
+                f"🎯 Disfruta el acceso premium!",
+                reply_markup=keyboard,
+                parse_mode='Markdown'
+            )
+        else:
+            await query.edit_message_text(
+                "❌ No tienes membresía activa",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⬅️ Volver", callback_data="back_to_start")
+                ]])
+            )
+    
+    except Exception as e:
+        logger.error(f"❌ Error mostrando membresía: {e}")
+        await query.answer("❌ Error obteniendo información")
+
+async def start_command_from_callback(query):
+    """Comando start desde callback"""
+    user = query.from_user
+    user_id = user.id
+    first_name = user.first_name or "Usuario"
+    
+    try:
+        result = supabase.table('memberships').select('*').eq('telegram_user_id', user_id).execute()
+        
+        if result.data:
+            membership = result.data[0]
+            end_date_str = membership['membership_end_date']
+            
+            if end_date_str.endswith('Z'):
+                end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
+            else:
+                end_date = datetime.fromisoformat(end_date_str + '+00:00')
+            
+            if end_date > datetime.now(end_date.tzinfo):
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔗 Unirse al Grupo", callback_data=f"join_group_{user_id}")],
+                    [InlineKeyboardButton("📊 Mi Membresía", callback_data=f"my_membership_{user_id}")]
+                ])
+                
+                await query.edit_message_text(
+                    f"¡Hola {first_name}! 👻\n\n"
+                    f"✅ Tu membresía está **ACTIVA**\n"
+                    f"📅 Expira: {end_date.strftime('%d/%m/%Y %H:%M')}\n\n"
+                    f"Haz clic en 'Unirse al Grupo' para obtener el enlace:",
+                    reply_markup=keyboard,
+                    parse_mode='Markdown'
+                )
+                return
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💰 Pagar Membresía - $12 USDT", callback_data=f"pay_membership_{user_id}")],
+            [InlineKeyboardButton("ℹ️ Información", callback_data="info")]
+        ])
+        
+        await query.edit_message_text(
+            f"¡Bienvenido a Ghost Traders! 👻\n\n"
+            f"🎯 **Plan de Prueba Especial**\n"
+            f"💰 Solo **$12 USDT (TRC20)**\n"
+            f"⏰ Acceso por **30 días**\n\n"
+            f"🔥 **¿Qué obtienes?**\n"
+            f"• Acceso al grupo VIP\n"
+            f"• Señales de trading premium\n"
+            f"• Análisis técnico diario\n"
+            f"• Soporte 24/7\n\n"
+            f"👇 Haz clic para comenzar:",
+            reply_markup=keyboard,
+            parse_mode='Markdown'
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ Error en start_command_from_callback: {e}")
+        await query.edit_message_text("❌ Error interno. Intenta de nuevo.")
+
 async def handle_message(update: Update, context):
-    logger.info(f"📨 Mensaje recibido de usuario {update.message.from_user.id}")
-    await update.message.reply_text("Usa /start para comenzar el proceso de membresía.")
+    """Handler para mensajes de texto"""
+    await update.message.reply_text(
+        "👋 ¡Hola! Usa /start para comenzar el proceso de membresía.",
+        parse_mode='Markdown'
+    )
 
-# Webhook para NOWPayments IPN
+# ============= WEBHOOKS FLASK =============
+
 @app.route('/webhook/nowpayments', methods=['POST'])
 def nowpayments_webhook():
+    """Webhook para NOWPayments IPN"""
     logger.info("💰 Webhook NOWPayments recibido")
+    
     try:
         data = request.get_json()
         signature = request.headers.get('x-nowpayments-sig')
-        
-        logger.info(f"Datos recibidos: {data}")
-        logger.info(f"Signature: {signature}")
         
         if not data or not signature:
             logger.error("❌ Missing data or signature")
@@ -171,43 +492,47 @@ def nowpayments_webhook():
         
         # Verificar firma
         sorted_data = json.dumps(data, sort_keys=True, separators=(',', ':'))
-        computed_sig = hmac.new(NOWPAYMENTS_IPN_SECRET.encode(), sorted_data.encode(), hashlib.sha512).hexdigest()
+        computed_sig = hmac.new(
+            NOWPAYMENTS_IPN_SECRET.encode(), 
+            sorted_data.encode(), 
+            hashlib.sha512
+        ).hexdigest()
         
         if signature != computed_sig:
-            logger.error(f"❌ Invalid signature. Expected: {computed_sig}, Got: {signature}")
+            logger.error(f"❌ Invalid signature")
             return jsonify({"error": "Invalid signature"}), 400
-
+        
         logger.info("✅ Signature válida")
-
-        if data.get('payment_status') == 'finished':
-            order_id = data.get('order_id', '')
-            logger.info(f"🎉 Pago completado para orden: {order_id}")
-            
-            if order_id.startswith('user_'):
+        logger.info(f"📊 Datos del pago: {data}")
+        
+        payment_status = data.get('payment_status')
+        order_id = data.get('order_id', '')
+        payment_id = data.get('payment_id', '')
+        
+        if payment_status == 'finished' and order_id.startswith('user_'):
+            try:
+                user_id = int(order_id.split('_')[1])
+                end_date = datetime.now() + timedelta(days=30)
+                
+                # Activar membresía
+                supabase.table('memberships').upsert({
+                    'telegram_user_id': user_id,
+                    'membership_end_date': end_date.isoformat(),
+                    'status': 'active',
+                    'payment_id': payment_id
+                }).execute()
+                
+                logger.info(f"✅ Membresía activada automáticamente para usuario {user_id}")
+                
+                # Enviar notificación al usuario
                 try:
-                    user_id = int(order_id.split('_')[1])
-                    end_date = datetime.now() + timedelta(days=30)
-                    
-                    # Insertar o actualizar membresía
-                    supabase.table('memberships').upsert({
-                        'telegram_user_id': user_id,
-                        'membership_end_date': end_date.isoformat(),
-                        'status': 'active'
-                    }).execute()
-                    
-                    logger.info(f"✅ Membresía actualizada para usuario {user_id}")
-                    
-                    # Enviar mensaje de confirmación y añadir al grupo
-                    asyncio.run_coroutine_threadsafe(
-                        confirm_payment(user_id), 
-                        asyncio.get_event_loop()
-                    )
-                    
+                    asyncio.create_task(send_payment_confirmation(user_id))
                 except Exception as e:
-                    logger.error(f"❌ Error procesando pago: {e}")
-                    return jsonify({"error": "Processing error"}), 500
-        else:
-            logger.info(f"Estado de pago: {data.get('payment_status')} - No procesado")
+                    logger.error(f"❌ Error enviando notificación: {e}")
+                
+            except Exception as e:
+                logger.error(f"❌ Error procesando pago: {e}")
+                return jsonify({"error": "Processing error"}), 500
         
         return jsonify({"status": "received"}), 200
         
@@ -215,25 +540,52 @@ def nowpayments_webhook():
         logger.error(f"❌ Error en webhook: {e}")
         return jsonify({"error": "Server error"}), 500
 
-async def confirm_payment(user_id):
-    logger.info(f"Confirmando pago para usuario {user_id}")
+async def send_payment_confirmation(user_id):
+    """Enviar confirmación de pago al usuario"""
     try:
         await bot.send_message(
-            user_id, 
-            "🎉 ¡Pago confirmado! Bienvenido a Ghost Traders.\n\n"
-            "Añadiéndote al grupo VIP... ✅"
+            chat_id=user_id,
+            text="🎉 **¡Pago Confirmado!**\n\n"
+                 "✅ Tu membresía ha sido activada\n"
+                 "🔗 Ya puedes unirte al grupo VIP\n\n"
+                 "Usa /start para obtener el enlace de acceso",
+            parse_mode='Markdown'
         )
-        await bot.unban_chat_member(GROUP_ID, user_id)
-        await bot.send_message(user_id, "✅ ¡Has sido añadido al grupo exitosamente!")
-        logger.info(f"✅ Usuario {user_id} confirmado y añadido al grupo")
+        logger.info(f"✅ Notificación enviada a usuario {user_id}")
     except Exception as e:
-        logger.error(f"❌ Error confirmando pago: {e}")
-        await bot.send_message(user_id, f"❌ Error al añadir al grupo: {str(e)}")
+        logger.error(f"❌ Error enviando notificación: {e}")
 
-# Endpoint para verificar membresías expiradas
+@app.route('/webhook/telegram', methods=['POST'])
+def telegram_webhook():
+    """Webhook para Telegram"""
+    logger.info("📱 Webhook Telegram recibido")
+    
+    try:
+        json_data = request.get_json()
+        if not json_data:
+            logger.error("❌ No JSON data received")
+            return 'error', 400
+        
+        update = Update.de_json(json_data, bot)
+        
+        if application:
+            # Ejecutar el update en el loop del bot
+            asyncio.run_coroutine_threadsafe(
+                application.process_update(update),
+                application.updater.bot._loop if hasattr(application, 'updater') else asyncio.get_event_loop()
+            )
+        
+        return 'ok', 200
+        
+    except Exception as e:
+        logger.error(f"❌ Error en webhook telegram: {e}")
+        return 'error', 500
+
 @app.route('/check_memberships', methods=['GET'])
 def check_memberships():
+    """Verificar y limpiar membresías expiradas"""
     logger.info("🔍 Verificando membresías expiradas")
+    
     try:
         now = datetime.now().isoformat()
         expired = supabase.table('memberships').select('telegram_user_id').lt('membership_end_date', now).eq('status', 'active').execute()
@@ -242,87 +594,173 @@ def check_memberships():
         for member in expired.data:
             user_id = member['telegram_user_id']
             try:
-                asyncio.run_coroutine_threadsafe(
-                    bot.ban_chat_member(GROUP_ID, user_id),
-                    asyncio.get_event_loop()
-                )
-                supabase.table('memberships').update({'status': 'expired'}).eq('telegram_user_id', user_id).execute()
+                # Marcar como expirada en la base de datos
+                supabase.table('memberships').update({
+                    'status': 'expired'
+                }).eq('telegram_user_id', user_id).execute()
+                
                 removed_count += 1
-                logger.info(f"Usuario {user_id} removido por membresía expirada")
+                logger.info(f"🗑️ Membresía expirada marcada para usuario {user_id}")
+                
+                # Opcionalmente enviar notificación de expiración
+                asyncio.create_task(send_expiration_notice(user_id))
+                
             except Exception as e:
-                logger.error(f"Error removiendo usuario {user_id}: {e}")
-
-        logger.info(f"✅ Verificación completada. Usuarios removidos: {removed_count}")
-        return jsonify({"status": "checked", "removed": removed_count}), 200
+                logger.error(f"❌ Error procesando usuario expirado {user_id}: {e}")
+        
+        logger.info(f"✅ Verificación completada. Membresías expiradas: {removed_count}")
+        return jsonify({"status": "checked", "expired": removed_count}), 200
         
     except Exception as e:
         logger.error(f"❌ Error checking memberships: {e}")
         return jsonify({"error": "Server error"}), 500
 
-# Webhook para Telegram
-@app.route('/webhook/telegram', methods=['POST'])
-def telegram_webhook():
-    logger.info("📱 Webhook Telegram recibido")
+async def send_expiration_notice(user_id):
+    """Enviar notificación de expiración"""
     try:
-        json_data = request.get_json()
-        logger.info(f"Datos de Telegram: {json_data}")
-        
-        update = Update.de_json(json_data, bot)
-        if application:
-            asyncio.run_coroutine_threadsafe(
-                application.process_update(update),
-                asyncio.get_event_loop()
-            )
-        logger.info("✅ Update procesado correctamente")
-        return 'ok', 200
+        await bot.send_message(
+            chat_id=user_id,
+            text="⏰ **Membresía Expirada**\n\n"
+                 "Tu acceso premium ha terminado.\n"
+                 "¿Quieres renovar? Usa /start para ver opciones.",
+            parse_mode='Markdown'
+        )
     except Exception as e:
-        logger.error(f"❌ Error en webhook telegram: {e}")
-        return 'error', 500
+        logger.error(f"❌ Error enviando notificación de expiración: {e}")
 
 # Endpoints de salud
 @app.route('/', methods=['GET'])
 def home():
+    """Endpoint principal"""
     return jsonify({
-        "status": "Ghost Traders Bot funcionando", 
+        "status": "Ghost Traders Bot funcionando",
+        "version": "3.0",
         "timestamp": datetime.now().isoformat(),
-        "version": "2.0"
+        "bot_username": "@ghost_traders_bot"
     })
 
 @app.route('/health', methods=['GET'])
 def health():
+    """Health check endpoint"""
     return jsonify({
-        "status": "healthy", 
+        "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "bot_configured": bool(TELEGRAM_TOKEN and SUPABASE_URL and SUPABASE_KEY)
+        "services": {
+            "telegram": bool(TELEGRAM_TOKEN),
+            "supabase": bool(SUPABASE_URL and SUPABASE_KEY),
+            "nowpayments": bool(NOWPAYMENTS_API_KEY),
+            "bot_configured": application is not None
+        }
     })
 
-# Configurar el bot
-def setup_bot():
-    global application
-    logger.info("🤖 Configurando aplicación de Telegram")
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-    application.add_handler(CommandHandler('start', start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("✅ Handlers configurados")
+@app.route('/webhook/nowpayments', methods=['GET'])
+def nowpayments_webhook_get():
+    """GET endpoint para verificar webhook"""
+    return jsonify({
+        "message": "NOWPayments webhook endpoint",
+        "method": "POST required",
+        "status": "ready"
+    })
 
-# Inicializar en un hilo separado
-def start_bot():
+@app.route('/webhook/telegram', methods=['GET'])
+def telegram_webhook_get():
+    """GET endpoint para verificar webhook"""
+    return jsonify({
+        "message": "Telegram webhook endpoint", 
+        "method": "POST required",
+        "status": "ready"
+    })
+
+# ============= CONFIGURACIÓN DEL BOT =============
+
+def setup_application():
+    """Configurar la aplicación de Telegram"""
+    global application
+    
+    logger.info("🤖 Configurando aplicación de Telegram")
+    
+    try:
+        # Crear aplicación
+        application = Application.builder().token(TELEGRAM_TOKEN).build()
+        
+        # Agregar handlers
+        application.add_handler(CommandHandler('start', start_command))
+        application.add_handler(CallbackQueryHandler(button_callback))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        
+        logger.info("✅ Aplicación de Telegram configurada")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Error configurando aplicación: {e}")
+        return False
+
+def run_bot():
+    """Ejecutar el bot en un hilo separado"""
     logger.info("🚀 Iniciando bot en hilo separado")
+    
+    # Crear nuevo event loop para este hilo
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    setup_bot()
-    logger.info("✅ Bot configurado, manteniendo loop activo")
-    loop.run_forever()
+    
+    # Configurar aplicación
+    if not setup_application():
+        logger.error("❌ No se pudo configurar la aplicación")
+        return
+    
+    try:
+        # Inicializar la aplicación
+        loop.run_until_complete(application.initialize())
+        
+        logger.info("✅ Bot inicializado correctamente")
+        logger.info("🔄 Manteniendo loop activo para procesar updates...")
+        
+        # Mantener el loop corriendo para procesar updates de webhook
+        loop.run_forever()
+        
+    except Exception as e:
+        logger.error(f"❌ Error ejecutando bot: {e}")
+    finally:
+        try:
+            loop.run_until_complete(application.shutdown())
+        except:
+            pass
+
+# ============= PUNTO DE ENTRADA PRINCIPAL =============
 
 if __name__ == '__main__':
-    logger.info("🎬 Iniciando aplicación principal")
+    logger.info("🎬 Iniciando Ghost Traders Bot")
+    
+    # Verificar configuraciones críticas
+    missing_configs = []
+    if not TELEGRAM_TOKEN:
+        missing_configs.append("TELEGRAM_TOKEN")
+    if not SUPABASE_URL:
+        missing_configs.append("SUPABASE_URL") 
+    if not SUPABASE_KEY:
+        missing_configs.append("SUPABASE_KEY")
+    if not NOWPAYMENTS_API_KEY:
+        missing_configs.append("NOWPAYMENTS_API_KEY")
+    if not NOWPAYMENTS_IPN_SECRET:
+        missing_configs.append("NOWPAYMENTS_IPN_SECRET")
+    
+    if missing_configs:
+        logger.error(f"❌ Configuraciones faltantes: {', '.join(missing_configs)}")
+        sys.exit(1)
     
     # Iniciar bot en hilo separado
-    bot_thread = threading.Thread(target=start_bot)
-    bot_thread.daemon = True
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
     logger.info("✅ Hilo del bot iniciado")
     
+    # Esperar un momento para que el bot se inicialice
+    import time
+    time.sleep(2)
+    
     # Iniciar servidor Flask
     logger.info(f"🌐 Iniciando servidor Flask en puerto {PORT}")
-    app.run(host='0.0.0.0', port=PORT, debug=False)
+    try:
+        app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
+    except Exception as e:
+        logger.error(f"❌ Error iniciando servidor Flask: {e}")
+        sys.exit(1)
