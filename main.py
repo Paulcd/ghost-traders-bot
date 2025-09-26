@@ -27,13 +27,16 @@ load_dotenv()
 
 app = Flask(__name__)
 
+# NUEVO: Variable global para el loop
+loop = None
+
 # Configuraciones
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 SUPABASE_URL = os.getenv('SUPABASE_URL')
 SUPABASE_KEY = os.getenv('SUPABASE_KEY')
 NOWPAYMENTS_API_KEY = os.getenv('NOWPAYMENTS_API_KEY')
 NOWPAYMENTS_IPN_SECRET = os.getenv('NOWPAYMENTS_IPN_SECRET')
-GROUP_ID = int(os.getenv('GROUP_ID', -1002877292793))
+GROUP_ID = int(os.getenv('GROUP_ID', -1002202662368))
 PORT = int(os.getenv('PORT', 8080))
 
 logger.info(f"🚀 Iniciando Ghost Traders Bot")
@@ -569,10 +572,10 @@ def telegram_webhook():
         update = Update.de_json(json_data, bot)
         
         if application:
-            # Ejecutar el update en el loop del bot
+            # CAMBIO: Usa el loop global en lugar del condicional
             asyncio.run_coroutine_threadsafe(
                 application.process_update(update),
-                application.updater.bot._loop if hasattr(application, 'updater') else asyncio.get_event_loop()
+                loop  # Usa el loop global del hilo del bot
             )
         
         return 'ok', 200
@@ -697,6 +700,8 @@ def setup_application():
 
 def run_bot():
     """Ejecutar el bot en un hilo separado"""
+    global loop  # NUEVO: Declarar global
+    
     logger.info("🚀 Iniciando bot en hilo separado")
     
     # Crear nuevo event loop para este hilo
@@ -715,7 +720,7 @@ def run_bot():
         logger.info("✅ Bot inicializado correctamente")
         logger.info("🔄 Manteniendo loop activo para procesar updates...")
         
-        # Mantener el loop corriendo para procesar updates de webhook
+        # Mantener el loop corriendo para procesar updates
         loop.run_forever()
         
     except Exception as e:
@@ -726,10 +731,15 @@ def run_bot():
         except:
             pass
 
+# NUEVO: Iniciar el hilo del bot FUERA de if __name__ (se ejecuta al importar el módulo en Gunicorn)
+bot_thread = threading.Thread(target=run_bot, daemon=True)
+bot_thread.start()
+logger.info("✅ Hilo del bot iniciado")
+
 # ============= PUNTO DE ENTRADA PRINCIPAL =============
 
 if __name__ == '__main__':
-    logger.info("🎬 Iniciando Ghost Traders Bot")
+    logger.info("🎬 Iniciando en modo local")
     
     # Verificar configuraciones críticas
     missing_configs = []
@@ -748,12 +758,7 @@ if __name__ == '__main__':
         logger.error(f"❌ Configuraciones faltantes: {', '.join(missing_configs)}")
         sys.exit(1)
     
-    # Iniciar bot en hilo separado
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
-    logger.info("✅ Hilo del bot iniciado")
-    
-    # Esperar un momento para que el bot se inicialice
+    # Esperar un momento para que el bot se inicialice (solo local)
     import time
     time.sleep(2)
     
