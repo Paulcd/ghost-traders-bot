@@ -27,9 +27,6 @@ load_dotenv()
 
 app = Flask(__name__)
 
-# NUEVO: Variable global para el loop
-loop = None
-
 # Configuraciones
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 SUPABASE_URL = os.getenv('SUPABASE_URL')
@@ -188,7 +185,7 @@ async def button_callback(update: Update, context):
         user_id = int(data.split("_")[-1])
         
         # Crear invoice
-        pay_url, invoice_id = create_invoice(user_id, 12)
+        pay_url, invoice_id = await asyncio.to_thread(create_invoice, user_id, 12)
         
         if pay_url and invoice_id:
             keyboard = InlineKeyboardMarkup([
@@ -262,7 +259,7 @@ async def verify_payment_status(query, user_id, invoice_id):
         url = f"https://api.nowpayments.io/v1/payment/{invoice_id}"
         headers = {"x-api-key": NOWPAYMENTS_API_KEY}
         
-        response = requests.get(url, headers=headers, timeout=10)
+        response = await asyncio.to_thread(requests.get, url, headers=headers, timeout=10)
         
         if response.status_code == 200:
             data = response.json()
@@ -274,12 +271,16 @@ async def verify_payment_status(query, user_id, invoice_id):
                 # Activar membresía
                 end_date = datetime.now() + timedelta(days=30)
                 
-                supabase.table('memberships').upsert({
-                    'telegram_user_id': user_id,
-                    'membership_end_date': end_date.isoformat(),
-                    'status': 'active',
-                    'payment_id': invoice_id
-                }).execute()
+                # Función síncrona para Supabase
+                def update_membership():
+                    supabase.table('memberships').upsert({
+                        'telegram_user_id': user_id,
+                        'membership_end_date': end_date.isoformat(),
+                        'status': 'active',
+                        'payment_id': invoice_id
+                    }).execute()
+                
+                await asyncio.to_thread(update_membership)
                 
                 logger.info(f"✅ Membresía activada para usuario {user_id}")
                 
@@ -374,7 +375,10 @@ async def generate_group_invite(query, user_id):
 async def show_membership_info(query, user_id):
     """Mostrar información de la membresía"""
     try:
-        result = supabase.table('memberships').select('*').eq('telegram_user_id', user_id).execute()
+        def get_membership():
+            return supabase.table('memberships').select('*').eq('telegram_user_id', user_id).execute()
+        
+        result = await asyncio.to_thread(get_membership)
         
         if result.data:
             membership = result.data[0]
@@ -420,7 +424,10 @@ async def start_command_from_callback(query):
     first_name = user.first_name or "Usuario"
     
     try:
-        result = supabase.table('memberships').select('*').eq('telegram_user_id', user_id).execute()
+        def get_membership():
+            return supabase.table('memberships').select('*').eq('telegram_user_id', user_id).execute()
+        
+        result = await asyncio.to_thread(get_membership)
         
         if result.data:
             membership = result.data[0]
@@ -517,21 +524,28 @@ def nowpayments_webhook():
                 user_id = int(order_id.split('_')[1])
                 end_date = datetime.now() + timedelta(days=30)
                 
-                # Activar membresía
-                supabase.table('memberships').upsert({
-                    'telegram_user_id': user_id,
-                    'membership_end_date': end_date.isoformat(),
-                    'status': 'active',
-                    'payment_id': payment_id
-                }).execute()
+                # Función síncrona para actualizar Supabase
+                def update_membership():
+                    supabase.table('memberships').upsert({
+                        'telegram_user_id': user_id,
+                        'membership_end_date': end_date.isoformat(),
+                        'status': 'active',
+                        'payment_id': payment_id
+                    }).execute()
+                
+                # Ejecutar la actualización en un thread separado
+                threading.Thread(target=update_membership).start()
                 
                 logger.info(f"✅ Membresía activada automáticamente para usuario {user_id}")
                 
-                # Enviar notificación al usuario
-                try:
-                    asyncio.create_task(send_payment_confirmation(user_id))
-                except Exception as e:
-                    logger.error(f"❌ Error enviando notificación: {e}")
+                # Enviar notificación asíncrona
+                def send_notification():
+                    try:
+                        asyncio.run(send_payment_confirmation(user_id))
+                    except Exception as e:
+                        logger.error(f"❌ Error enviando notificación: {e}")
+                
+                threading.Thread(target=send_notification).start()
                 
             except Exception as e:
                 logger.error(f"❌ Error procesando pago: {e}")
@@ -572,11 +586,15 @@ def telegram_webhook():
         update = Update.de_json(json_data, bot)
         
         if application:
-            # CAMBIO: Usa el loop global en lugar del condicional
-            asyncio.run_coroutine_threadsafe(
-                application.process_update(update),
-                loop  # Usa el loop global del hilo del bot
-            )
+            # Procesar el update usando el dispatcher
+            def process_update():
+                try:
+                    asyncio.run(application.process_update(update))
+                except Exception as e:
+                    logger.error(f"❌ Error procesando update: {e}")
+            
+            # Ejecutar en un thread separado para no bloquear Flask
+            threading.Thread(target=process_update).start()
         
         return 'ok', 200
         
@@ -591,22 +609,36 @@ def check_memberships():
     
     try:
         now = datetime.now().isoformat()
-        expired = supabase.table('memberships').select('telegram_user_id').lt('membership_end_date', now).eq('status', 'active').execute()
         
+        # Función síncrona para obtener membresías expiradas
+        def get_expired_memberships():
+            return supabase.table('memberships').select('telegram_user_id').lt('membership_end_date', now).eq('status', 'active').execute()
+        
+        expired_result = get_expired_memberships()
+        expired_data = expired_result.data
         removed_count = 0
-        for member in expired.data:
+        
+        for member in expired_data:
             user_id = member['telegram_user_id']
             try:
-                # Marcar como expirada en la base de datos
-                supabase.table('memberships').update({
-                    'status': 'expired'
-                }).eq('telegram_user_id', user_id).execute()
+                # Función síncrona para actualizar membresía
+                def update_expired_membership(u_id):
+                    supabase.table('memberships').update({
+                        'status': 'expired'
+                    }).eq('telegram_user_id', u_id).execute()
                 
+                update_expired_membership(user_id)
                 removed_count += 1
                 logger.info(f"🗑️ Membresía expirada marcada para usuario {user_id}")
                 
-                # Opcionalmente enviar notificación de expiración
-                asyncio.create_task(send_expiration_notice(user_id))
+                # Enviar notificación de expiración
+                def send_expiration():
+                    try:
+                        asyncio.run(send_expiration_notice(user_id))
+                    except Exception as e:
+                        logger.error(f"❌ Error enviando notificación de expiración: {e}")
+                
+                threading.Thread(target=send_expiration).start()
                 
             except Exception as e:
                 logger.error(f"❌ Error procesando usuario expirado {user_id}: {e}")
@@ -629,7 +661,7 @@ async def send_expiration_notice(user_id):
             parse_mode='Markdown'
         )
     except Exception as e:
-        logger.error(f"❌ Error enviando notificación de expiración: {e}")
+        logger.error(f"❌ Error enviando notificación de expiración a {user_id}: {e}")
 
 # Endpoints de salud
 @app.route('/', methods=['GET'])
@@ -680,92 +712,70 @@ def setup_application():
     """Configurar la aplicación de Telegram"""
     global application
     
-    logger.info("🤖 Configurando aplicación de Telegram")
+    if application is not None:
+        logger.info("✅ Aplicación ya configurada")
+        return True
     
     try:
-        # Crear aplicación
+        # Crear la aplicación
         application = Application.builder().token(TELEGRAM_TOKEN).build()
         
-        # Agregar handlers
-        application.add_handler(CommandHandler('start', start_command))
+        # Registrar handlers
+        application.add_handler(CommandHandler("start", start_command))
         application.add_handler(CallbackQueryHandler(button_callback))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         
-        logger.info("✅ Aplicación de Telegram configurada")
+        logger.info("✅ Aplicación configurada correctamente")
         return True
         
     except Exception as e:
         logger.error(f"❌ Error configurando aplicación: {e}")
         return False
 
-def run_bot():
-    """Ejecutar el bot en un hilo separado"""
-    global loop  # NUEVO: Declarar global
-    
-    logger.info("🚀 Iniciando bot en hilo separado")
-    
-    # Crear nuevo event loop para este hilo
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    # Configurar aplicación
+async def initialize_bot():
+    """Inicializar el bot de forma asíncrona"""
     if not setup_application():
         logger.error("❌ No se pudo configurar la aplicación")
-        return
+        return False
     
     try:
         # Inicializar la aplicación
-        loop.run_until_complete(application.initialize())
+        await application.initialize()
+        await application.start()
         
-        logger.info("✅ Bot inicializado correctamente")
-        logger.info("🔄 Manteniendo loop activo para procesar updates...")
+        # Establecer webhook
+        webhook_url = f"{get_base_url()}/webhook/telegram"
+        await application.bot.set_webhook(url=webhook_url)
+        logger.info(f"✅ Webhook establecido en: {webhook_url}")
         
-        # Mantener el loop corriendo para procesar updates
-        loop.run_forever()
+        return True
         
     except Exception as e:
-        logger.error(f"❌ Error ejecutando bot: {e}")
-    finally:
-        try:
-            loop.run_until_complete(application.shutdown())
-        except:
-            pass
+        logger.error(f"❌ Error inicializando bot: {e}")
+        return False
 
-# NUEVO: Iniciar el hilo del bot FUERA de if __name__ (se ejecuta al importar el módulo en Gunicorn)
-bot_thread = threading.Thread(target=run_bot, daemon=True)
-bot_thread.start()
-logger.info("✅ Hilo del bot iniciado")
+# ============= INICIALIZACIÓN =============
 
-# ============= PUNTO DE ENTRADA PRINCIPAL =============
+def init_bot_sync():
+    """Inicializar el bot de forma síncrona para Gunicorn"""
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        success = loop.run_until_complete(initialize_bot())
+        if success:
+            logger.info("✅ Bot inicializado correctamente")
+        else:
+            logger.error("❌ Error inicializando bot")
+        return success
+    except Exception as e:
+        logger.error(f"❌ Error en inicialización síncrona: {e}")
+        return False
+
+# Inicializar el bot cuando se importa el módulo
+logger.info("🎬 Inicializando bot...")
+init_bot_sync()
 
 if __name__ == '__main__':
-    logger.info("🎬 Iniciando en modo local")
-    
-    # Verificar configuraciones críticas
-    missing_configs = []
-    if not TELEGRAM_TOKEN:
-        missing_configs.append("TELEGRAM_TOKEN")
-    if not SUPABASE_URL:
-        missing_configs.append("SUPABASE_URL") 
-    if not SUPABASE_KEY:
-        missing_configs.append("SUPABASE_KEY")
-    if not NOWPAYMENTS_API_KEY:
-        missing_configs.append("NOWPAYMENTS_API_KEY")
-    if not NOWPAYMENTS_IPN_SECRET:
-        missing_configs.append("NOWPAYMENTS_IPN_SECRET")
-    
-    if missing_configs:
-        logger.error(f"❌ Configuraciones faltantes: {', '.join(missing_configs)}")
-        sys.exit(1)
-    
-    # Esperar un momento para que el bot se inicialice (solo local)
-    import time
-    time.sleep(2)
-    
-    # Iniciar servidor Flask
-    logger.info(f"🌐 Iniciando servidor Flask en puerto {PORT}")
-    try:
-        app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
-    except Exception as e:
-        logger.error(f"❌ Error iniciando servidor Flask: {e}")
-        sys.exit(1)
+    # Modo desarrollo
+    logger.info("🌐 Modo desarrollo - usando Flask dev server")
+    app.run(host='0.0.0.0', port=PORT, debug=False)
