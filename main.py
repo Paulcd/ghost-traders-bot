@@ -585,24 +585,28 @@ def telegram_webhook():
         
         logger.info(f"📋 Datos recibidos: {json_data}")
         
-        update = Update.de_json(json_data, bot)
-        
-        if application:
-            # NUEVA IMPLEMENTACIÓN: Crear un nuevo loop para el hilo
+        # CORRECCIÓN: Usar el bot ya inicializado en lugar de crear Update con bot sin inicializar
+        if application and application.bot:
             def process_update_thread():
                 try:
+                    # Crear nuevo loop para este hilo
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)
+                    
+                    # Crear Update usando el bot de la aplicación (ya inicializado)
+                    update = Update.de_json(json_data, application.bot)
+                    
+                    # Procesar el update
                     loop.run_until_complete(application.process_update(update))
                     loop.close()
                     logger.info("✅ Update procesado correctamente")
                 except Exception as e:
                     logger.error(f"❌ Error procesando update: {e}")
             
-            # Ejecutar en un hilo separado
+            # Ejecutar en hilo separado
             threading.Thread(target=process_update_thread, daemon=True).start()
         else:
-            logger.error("❌ Application no está inicializada")
+            logger.error("❌ Application o bot no están inicializados")
             return 'error', 500
         
         return 'ok', 200
@@ -672,51 +676,6 @@ async def send_expiration_notice(user_id):
     except Exception as e:
         logger.error(f"❌ Error enviando notificación de expiración a {user_id}: {e}")
 
-@app.route('/test_bot', methods=['GET'])
-def test_bot():
-    """Endpoint para probar el bot manualmente"""
-    try:
-        # Simular un update de /start
-        test_update = {
-            "update_id": 123456789,
-            "message": {
-                "message_id": 1,
-                "from": {
-                    "id": 12345,
-                    "is_bot": False,
-                    "first_name": "Test",
-                    "username": "testuser"
-                },
-                "chat": {
-                    "id": 12345,
-                    "first_name": "Test",
-                    "username": "testuser",
-                    "type": "private"
-                },
-                "date": 1640995200,
-                "text": "/start"
-            }
-        }
-        
-        update = Update.de_json(test_update, bot)
-        
-        def process_test():
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                loop.run_until_complete(application.process_update(update))
-                loop.close()
-                logger.info("✅ Test update procesado")
-            except Exception as e:
-                logger.error(f"❌ Error en test: {e}")
-        
-        threading.Thread(target=process_test, daemon=True).start()
-        
-        return jsonify({"status": "test_enviado", "update": test_update}), 200
-        
-    except Exception as e:
-        logger.error(f"❌ Error en test: {e}")
-        return jsonify({"error": str(e)}), 500
 
 # Endpoints de salud
 @app.route('/', methods=['GET'])
@@ -817,6 +776,10 @@ def init_bot_sync():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         success = loop.run_until_complete(initialize_bot())
+        
+        # NO cerrar el loop aquí para mantener la aplicación viva
+        # loop.close()  # <- COMENTADO
+        
         if success:
             logger.info("✅ Bot inicializado correctamente")
         else:
@@ -825,6 +788,62 @@ def init_bot_sync():
     except Exception as e:
         logger.error(f"❌ Error en inicialización síncrona: {e}")
         return False
+
+# ============= ENDPOINT DE TESTING =============
+
+@app.route('/test_bot', methods=['GET'])
+def test_bot():
+    """Endpoint para probar el bot manualmente"""
+    try:
+        if not application or not application.bot:
+            return jsonify({"error": "Bot no inicializado"}), 500
+            
+        # Simular un update de /start
+        test_update = {
+            "update_id": 999999999,
+            "message": {
+                "message_id": 1,
+                "from": {
+                    "id": 12345,
+                    "is_bot": False,
+                    "first_name": "Test",
+                    "username": "testuser"
+                },
+                "chat": {
+                    "id": 12345,
+                    "first_name": "Test",
+                    "username": "testuser",
+                    "type": "private"
+                },
+                "date": 1640995200,
+                "text": "/start"
+            }
+        }
+        
+        def process_test():
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                # Usar el bot de la aplicación (ya inicializado)
+                update = Update.de_json(test_update, application.bot)
+                loop.run_until_complete(application.process_update(update))
+                loop.close()
+                logger.info("✅ Test update procesado")
+            except Exception as e:
+                logger.error(f"❌ Error en test: {e}")
+        
+        threading.Thread(target=process_test, daemon=True).start()
+        
+        return jsonify({
+            "status": "test_enviado", 
+            "message": "Revisa los logs para ver el resultado",
+            "bot_initialized": bool(application and application.bot)
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"❌ Error en test: {e}")
+        return jsonify({"error": str(e)}), 500
 
 # Inicializar el bot cuando se importa el módulo
 logger.info("🎬 Inicializando bot...")
